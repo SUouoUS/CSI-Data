@@ -1,0 +1,11 @@
+# 파이썬 가상환경 / 캐시
+.venv/
+__pycache__/
+*.py[cod]
+
+# csi_core.parse_file 이 만드는 파싱 캐시. 원본 로그에서 자동 재생성되므로 커밋하지 않는다.
+data/*.cache.npz
+
+# OS
+Thumbs.db
+.DS_Store
