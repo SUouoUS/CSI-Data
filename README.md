@@ -35,18 +35,32 @@ sc ±60… ±64  (idx 124–132)         0.6–1.4  → guard
 
 ---
 
-## 파일럿 데이터 (10세션)
+## 파일럿 데이터
+
+**배치 B — 현재 `data/`에 있는 8세션.** 분석은 전부 이 배치로 돌린다.
 
 | 파일 | 구성 | 비고 |
 |---|---|---|
 | `P01_stable` `P02_stable` `P03_stable` | still 5분 | 피험자 3명 |
-| `P01_motion` `P02_motion` `P03_motion` | still 2분 → **motion 1분** → still 2분 | 15초 간격 동작 4회 |
+| `P01_motion` `P02_motion` `P03_motion` | still 2분 → **motion 1분** → still 2분 | 15초 간격 자세변경 4회 |
 | `empty1` `empty2` | empty 5분 | |
-| `stable_5min` `empty_5min` | still / empty 5분 | 선행 수집 (배치 A) |
+
+**배치 A — `stable_5min` / `empty_5min` 2세션. 현재 `data/`에 없다.**
+아래 「결과」절의 `A_stable` `A_empty` 수치는 이 파일들이 있던 때의 실행 결과다.
+배치 A와 배치 B는 캡처 조건이 달랐다(수신률 17.5–18.1 vs 19.1–19.4 Hz, 프레임 손실
+7.7–10.7 % vs 1.1–2.7 %). 파일을 되살리더라도 섞어 쓰면 배치 효과가 상태 효과로
+오인될 수 있으므로 `sessions.py`의 `batch`로 층화해서 봐야 한다.
+
+**배치 C — 피험자 4명, 세션당 약 14분 (`empty` 3분 → `still` 5분 → `empty` 3분,
+전환 전후 1분 대기는 라벨에서 제외).**
 
 > [!WARNING]
-> 배치 A(2개)와 배치 B(8개)는 캡처 조건이 다르다. 수신률 17.5–18.1 vs 19.1–19.4 Hz,
-> 프레임 손실 7.7–10.7 % vs 1.1–2.7 %. 섞어 쓰면 배치 효과가 상태 효과로 오인될 수 있다.
+> **배치 C는 아직 실행할 수 없다.** 참가자 ID 매핑이 확정되지 않았고 익명화된 raw
+> 파일이 `data/`에 준비되지 않았다. `sessions.py`에는 프로토콜 구간 상수
+> (`P14_SEGMENTS`)와 주석 TODO만 두었고, **실행 가능한 `SESSIONS` 목록에는 넣지
+> 않았다.** 미확정 세션이 분석 대상으로 선택되면 안 되기 때문이다.
+> 배치 C에서는 A안·B안도 지원하지 않는다 — 이유는
+> [`docs/RESULTS_GUIDE.md`](docs/RESULTS_GUIDE.md)의 배치별 지원 매트릭스를 보라.
 
 ---
 
@@ -129,19 +143,74 @@ TX/RX를 잇는 경로 근처에 가슴이 오도록 두면 미세 움직임이 
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install numpy scipy matplotlib
 
-python s1_check_format.py     # 반드시 먼저. FAIL이면 여기서 멈춘다
-python s2_session_stats.py    # 세션 단위 비교
-python s3_subcarrier.py       # subcarrier 스크리닝
-python s5_pilot_check.py      # 파일럿 진단
+python run_analysis.py all         # 전체 분석 (QC → baseline → pilot → A안 → B안)
+python run_analysis.py qc          # 데이터 품질 검사
+python run_analysis.py baseline    # 기존 정규화 기반 분석 (ML V1 메인)
+python run_analysis.py a           # A안: RSSI·신호 크기
+python run_analysis.py b           # B안: subcarrier 상관 구조
+python run_analysis.py transition  # 상태 전환 시각화 (배치 C 전용)
+
+python run_analysis.py all --batch batch_c   # 배치 지정
+python run_analysis.py all --dry-run         # 실행 계획만 출력
 ```
 
-파싱·전처리·특징은 전부 `csi_core.py`에만 둔다. 결과물은 `out/`에 저장된다.
+인자 없이 실행하면 사용법이 나온다. `all` 모드는 QC가 실패하면 후속 분석을
+중단한다(`--keep-going`으로 무시 가능).
+
+**결과 구조**
+
+```
+out/batch_b_2026-09-01/{qc,baseline,pilot,method_a_rssi,method_b_structure}/
+out/batch_c_2026-09-02/{qc,baseline,pilot,transition}/
+archive/{2026-09-01, 2026-09-02_before_refactor, old_outputs}/
+```
+
+`out/`에는 **가장 최근 실행 결과만** 있고 과거 결과는 `archive/`에 날짜별로 남는다.
+각 결과 폴더에 `README.md`·`run_metadata.json`·`console.log`가 함께 생성된다.
+
+> [!IMPORTANT]
+> **팀 결정 전, 파일럿용 임시 구성이다.** 다음 세 가지는 아직 합의가 끝나지 않았다.
+> ① 혼합 세션의 구간 라벨을 메인 저장소 어디에 저장할지 — `sessions.py`의 `segments`
+> 정의는 **파일럿 분석용 임시 매니페스트**이며 메인 csileep의 공식 데이터 계약이 아니다.
+> ② `empty`의 participant_id와 LOPO 처리 방법. ③ ESP32 raw 로그를 메인 schema 형식으로
+> 변환할지. 이 저장소의 산출물을 메인 저장소의 feature CSV나 LOPO 입력으로 그대로 쓰면 안 된다.
+
+분석 방법별 차이와 결과 파일 설명은 **[`docs/RESULTS_GUIDE.md`](docs/RESULTS_GUIDE.md)** 에 있다.
+
+파싱·전처리·특징은 전부 `csi_core.py`에만 둔다.
 새 세션은 `data/`에 넣고 `sessions.py`의 `SESSIONS`에 한 줄 추가하면 된다.
 
 ```python
 {"name": "b2_01_P02", "scenario": "S-1", "file": "b2_01_P02_stable.txt",
  "subject": "P02", "batch": "B2", "segments": [("still", 0.0, 299.0)]},
 ```
+
+<details>
+<summary>문제 해결용 — 개별 스크립트 직접 실행</summary>
+
+`run_analysis.py`를 거치지 않고 스크립트 하나만 돌려보고 싶을 때 쓴다.
+출력 위치와 대상 배치는 환경변수로 지정한다. 지정하지 않으면 결과가 `out/` 루트에
+바로 떨어지고 배치는 `B`가 된다.
+
+```bash
+# Windows PowerShell
+$env:CSI_OUT_DIR = "C:\CSI_Project\out\batch_b_2026-09-01\baseline"
+$env:CSI_BATCH   = "B"
+$env:PYTHONIOENCODING = "utf-8"     # cp949 콘솔에서 한글 출력이 깨지는 것을 막는다
+python s2_session_stats.py
+```
+
+| 스크립트 | 역할 | run_analysis.py 모드 |
+|---|---|---|
+| `s1_check_format.py` | 형식·무결성 검사 (FAIL이면 종료코드 1) | `qc` |
+| `s2_session_stats.py` | 세션 단위 비교 | `baseline` |
+| `s3_subcarrier.py` | subcarrier 스크리닝 | `baseline` |
+| `s5_pilot_check.py` | 파일럿 진단 | `pilot` |
+| `s5_rssi.py` | A안 RSSI·신호 크기 | `a` |
+| `s3b_structure.py` | B안 상관 구조 | `b` |
+| `s6_visualize.py` | 상태 전환 시각화 | `transition` |
+
+</details>
 
 ---
 
