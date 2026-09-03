@@ -3,8 +3,23 @@
 __pycache__/
 *.py[cod]
 
-# csi_core.parse_file 이 만드는 파싱 캐시. 원본 로그에서 자동 재생성되므로 커밋하지 않는다.
-data/*.cache.npz
+# 참가자 측정 데이터. GitHub 에 올리지 않는다.
+data/
+
+# 분석 산출물. out/ 은 항상 재생성되고 archive/ 는 로컬 보관용이다.
+# 팀 공용 설명은 out/ 안이 아니라 docs/RESULTS_GUIDE.md 에 둔다.
+out/
+archive/
+
+# 다른 팀원에게 받은 비교용 코드 사본. 원본은 전달자가 갖고 있다.
+incoming_batch_c/
+
+# 옛 버전의 csi_core 가 만들던 파싱 캐시. 현재 파서는 캐시를 만들지 않지만,
+# 예전 캐시 파일이 남아 있어도 커밋되지 않도록 규칙은 유지한다.
+*.cache.npz
+
+# 참가자 실명 <-> 익명 ID 매핑. 절대 커밋하지 않는다.
+participant_map*
 
 # OS
 Thumbs.db

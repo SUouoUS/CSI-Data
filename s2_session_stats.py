@@ -350,7 +350,7 @@ def plot_session_points(rows, path):
         ax.grid(alpha=0.25, axis="y")
     for ax in axes[n_f:]:
         ax.axis("off")
-    fig.suptitle("세션 대표값 (점 1개 = 독립 표본 1개). 검정은 이 점들로만 한다.", y=1.0)
+    fig.suptitle("세션 대표값 (점 1개 = 세션 단위 관측값 1개). 검정은 이 점들로만 한다.", y=1.0)
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
