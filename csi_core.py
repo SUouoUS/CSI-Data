@@ -51,7 +51,6 @@ csi_core.py — ESP32 CSI 공통 모듈 (파싱 / 전처리 / 특징)
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -84,53 +83,88 @@ CONFIG_FIELDS: Tuple[str, ...] = (
 _INT_RE = re.compile(r"-?\d+")
 _TS_WRAP = 1 << 32  # local_timestamp 는 uint32 (us) 이므로 2^32 에서 랩어라운드
 
-CACHE_VERSION = 3  # 캐시 포맷이 바뀌면 올린다. 옛 캐시는 자동 무효화된다.
-
 
 class CSIParseError(RuntimeError):
     """파싱을 계속할 수 없는 상태. 조용히 넘기지 않고 즉시 멈추기 위한 예외."""
 
 
-def _find_header(lines: Sequence[str]) -> Tuple[Optional[int], Optional[List[str]]]:
+def _find_header(lines: Sequence[bytes]) -> Tuple[Optional[int], Optional[List[str]]]:
     """헤더 줄(type,...,data)을 찾는다. 없으면 (None, None)."""
     for i, ln in enumerate(lines):
         s = ln.strip()
-        if s.startswith("type,") and s.endswith("data"):
-            return i, s.split(",")
+        if s.startswith(b"type,") and s.endswith(b"data"):
+            return i, s.decode("ascii", "replace").split(",")
     return None, None
 
 
-def _cache_path(path: str) -> str:
-    base, _ = os.path.splitext(path)
-    return base + ".cache.npz"
+def _regex_keep_mask(chunks: Sequence[bytes], expected_len: int) -> np.ndarray:
+    """정규식으로 행마다 정수 개수를 다시 세어, expected_len 개인 행만 True 로 남긴다."""
+    return np.fromiter(
+        (len(_INT_RE.findall(c.decode("ascii", "replace"))) == expected_len
+         for c in chunks),
+        dtype=bool, count=len(chunks))
 
 
-def _cache_is_fresh(cache: str, src: str) -> bool:
-    if not os.path.exists(cache):
-        return False
+def _parse_chunks(chunks: List[bytes], expected_len: int, path: str
+                  ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    데이터부 전체를 한 번에 (n, expected_len) int16 배열로 만든다.
+    반환: (배열, 남긴 행 마스크). 마스크가 None 이면 모든 행을 그대로 썼다는 뜻이다.
+
+    빠른 경로는 b",".join 후 np.fromstring 한 번이다. 값이 깨져 있으면
+    (숫자 아닌 문자, 빈 필드 등) numpy 버전에 따라 ValueError 를 던지거나
+    그 지점에서 조용히 멈추고 짧은 배열을 주므로, 예외와 크기를 둘 다 확인한다.
+    어느 쪽이든 느리지만 견고한 정규식 경로로 폴백하고, 몇 행이 문제인지 경고로 남긴다.
+    """
+    n = len(chunks)
     try:
-        with np.load(cache, allow_pickle=False) as z:
-            if int(z["cache_version"]) != CACHE_VERSION:
-                return False
-            return (float(z["src_mtime"]) >= os.path.getmtime(src) - 1e-6
-                    and int(z["src_size"]) == os.path.getsize(src))
-    except Exception:
-        return False
+        arr = np.fromstring(b",".join(chunks), dtype=np.int16, sep=",")
+        if arr.size == n * expected_len:
+            return arr.reshape(n, expected_len), None
+        why = "크기가 맞지 않는다 (%d != %d x %d)" % (arr.size, n, expected_len)
+    except ValueError as exc:
+        why = "값을 끝까지 읽지 못했다 (%s)" % exc
+
+    print("[warn] %s: 일괄 파싱 실패, %s. 정규식 경로로 폴백한다." % (path, why))
+    keep = _regex_keep_mask(chunks, expected_len)
+    bad = int(n - keep.sum())
+    if bad:
+        print("[warn] %s: 정수 개수가 %d 개가 아닌 행 %d 개를 추가로 드롭한다."
+              % (path, expected_len, bad))
+    rows = [np.fromiter((int(v) for v in _INT_RE.findall(
+                            chunks[i].decode("ascii", "replace"))),
+                        dtype=np.int16, count=expected_len)
+            for i in range(n) if keep[i]]
+    if not rows:
+        raise CSIParseError("폴백 파싱에서도 유효 프레임이 0개다: %s" % path)
+    return np.stack(rows), keep
 
 
 def parse_file(
     path: str,
     expected_len: int = 384,
     source_mac: Optional[str] = None,
-    use_cache: bool = True,
 ) -> Dict[str, object]:
     """
-    CSI 로그 1개를 파싱한다.
+    CSI 로그 1개를 파싱한다. 파일을 bytes 로 읽고 2패스로 처리한다.
 
     data 필드는 "[1,-2,3,...]" 형태이고 내부에 쉼표가 있어서 csv.reader 로는 컬럼이 밀린다.
     또 파일에 따라 큰따옴표가 있을 수도 없을 수도 있다.
     따라서 행에서 '[' 위치를 찾아 헤더부/데이터부로 자른 뒤,
     헤더부 꼬리의 ' , " ' 를 제거하고 쉼표로 나눈다.
+
+    [1패스] 줄마다 헤더부(약 120 byte)만 디코드해서 필드 수 / MAC / rx_state / len 을 보고
+            유효 여부를 판정한다. 숫자 384개는 이 단계에서 건드리지 않는다.
+            개수 검증은 파싱 없이 chunk.count(b",") + 1 == expected_len 으로만 한다.
+    [2패스] 살아남은 줄의 데이터부를 b",".join 으로 이어붙여 np.fromstring(sep=",") 을
+            딱 한 번 호출하고 (n, expected_len) 으로 reshape 한다.
+
+    csi 는 int16 그대로 돌려준다. amplitude() / to_complex() 가 필요한 시점에 float64 로
+    올리므로, 여기서 미리 float64 로 만들면 세션당 메모리만 4배가 된다.
+
+    행마다 파이썬 루프로 숫자 리스트를 만들면 같은 파일이 30배 가까이 느려진다.
+    캐시(.npz)는 두지 않는다. 이 방식이면 세션 하나가 수십 ms 라 캐시 이득이 없고,
+    캐시 무효화를 놓쳐 옛 전처리 결과를 그대로 쓰게 되는 사고가 더 위험하다.
 
     드롭된 행은 사유별로 센다. 클래스마다 드롭률이 다르면 그 자체가 교락 요인이므로
     조용히 버려서는 안 된다.
@@ -138,23 +172,10 @@ def parse_file(
     if not os.path.exists(path):
         raise CSIParseError("파일이 없다: %s" % path)
 
-    cache = _cache_path(path)
-    if use_cache and _cache_is_fresh(cache, path):
-        with np.load(cache, allow_pickle=False) as z:
-            return {
-                "csi": z["csi"],
-                "rssi": z["rssi"],
-                "noise_floor": z["noise_floor"],
-                "t": z["t"],
-                "seq": z["seq"],
-                "meta": json.loads(str(z["meta_json"])),
-                "drops": json.loads(str(z["drops_json"])),
-                "columns": json.loads(str(z["columns_json"])),
-                "from_cache": True,
-            }
-
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        lines = fh.readlines()
+    # 로그 앞부분에 시리얼 잡음(비 UTF-8 바이트)이 섞여 있어 bytes 로 읽는다.
+    # CSI_DATA 로 시작하지 않는 줄은 어차피 전부 버리므로 디코드할 이유가 없다.
+    with open(path, "rb") as fh:
+        lines = fh.read().split(b"\n")
 
     hdr_idx, columns = _find_header(lines)
     has_header = columns is not None
@@ -174,38 +195,47 @@ def parse_file(
         "meta_len_mismatch": 0,   # 메타의 len 이 expected_len 과 다름
         "data_len_mismatch": 0,   # data 정수 개수가 expected_len 과 다름
         "mac_mismatch": 0,        # 지정한 송신 MAC 이 아님
+        "rx_state": 0,            # rx_state != 0 (수신 오류 프레임)
     }
 
-    csi_rows: List[np.ndarray] = []
+    # rx_state 필터는 헤더에 rx_state 컬럼이 실제로 있을 때만 건다. (가정 A1)
+    # 이 프로젝트 펌웨어 로그는 그 자리가 rx_format 이고 값이 전 프레임 1 이라,
+    # 'rx_state == 0' 을 무조건 적용하면 전 프레임이 드롭된다.
+    rx_state_idx = col.get("rx_state")
+    src_mac = source_mac.strip('" ').lower() if source_mac else None
+
+    chunks: List[bytes] = []      # 각 유효 행의 데이터부 ('[' 와 ']' 사이)
     rssi_l: List[int] = []
     nf_l: List[int] = []
     ts_l: List[int] = []
     seq_l: List[int] = []
-    config_counter: Dict[Tuple, int] = {}
+    cfg_l: List[Tuple] = []
     macs: Dict[str, int] = {}
     n_csi_lines = 0
 
     cfg_idx = [(f, col[f]) for f in CONFIG_FIELDS if f in col]
 
+    # --- 1패스: 헤더부만 보고 유효 행을 고른다 (숫자는 건드리지 않는다) ---
     for ln in lines:
         s = ln.strip()
-        if not s.startswith("CSI_DATA"):
+        if not s.startswith(b"CSI_DATA"):
             continue
         n_csi_lines += 1
 
-        b = s.find("[")
+        b = s.find(b"[")
         if b < 0:
             drops["no_bracket"] += 1
             continue
 
-        head = s[:b].rstrip(' ,"').split(",")
+        # 헤더부는 100 byte 남짓이라 행마다 디코드해도 부담이 없다.
+        head = s[:b].decode("ascii", "replace").rstrip(' ,"').split(",")
         if len(head) != n_head_expected:
             drops["head_field_count"] += 1
             continue
 
-        mac = head[col["mac"]]
+        mac = head[col["mac"]].strip('" ').lower()
         macs[mac] = macs.get(mac, 0) + 1
-        if source_mac is not None and mac != source_mac:
+        if src_mac is not None and mac != src_mac:
             drops["mac_mismatch"] += 1
             continue
 
@@ -215,35 +245,54 @@ def parse_file(
             nf_v = int(head[col["noise_floor"]])
             ts_v = int(head[col["local_timestamp"]])
             seq_v = int(head[col["id"]])
+            rx_state_v = 0 if rx_state_idx is None else int(head[rx_state_idx])
         except ValueError:
             drops["head_parse_error"] += 1
+            continue
+
+        if rx_state_v != 0:
+            drops["rx_state"] += 1
             continue
 
         if meta_len != expected_len:
             drops["meta_len_mismatch"] += 1
             continue
 
-        vals = _INT_RE.findall(s[b:])
-        if len(vals) != expected_len:
+        # 캡처가 중간에 끊긴 마지막 행은 ']' 가 없다. 그 경우 줄 끝까지를 데이터부로 보고
+        # 아래 개수 검증에서 걸러지게 둔다 (사유가 data_len_mismatch 로 남는다).
+        e = s.rfind(b"]")
+        chunk = s[b + 1:e] if e > b else s[b + 1:]
+        if chunk.count(b",") + 1 != expected_len:
             drops["data_len_mismatch"] += 1
             continue
 
-        csi_rows.append(np.fromiter((int(v) for v in vals), dtype=np.int16,
-                                    count=expected_len))
+        chunks.append(chunk)
         rssi_l.append(rssi_v)
         nf_l.append(nf_v)
         ts_l.append(ts_v)
         seq_l.append(seq_v)
+        cfg_l.append(tuple(head[i] for _, i in cfg_idx))
 
-        key = tuple(head[i] for _, i in cfg_idx)
-        config_counter[key] = config_counter.get(key, 0) + 1
-
-    if not csi_rows:
+    if not chunks:
         raise CSIParseError(
             "유효 프레임이 0개다: %s\n  CSI_DATA 행=%d, 드롭 내역=%s"
             % (path, n_csi_lines, drops))
 
-    csi = np.stack(csi_rows)
+    # --- 2패스: 데이터부를 한 번에 파싱한다 ---
+    csi, keep = _parse_chunks(chunks, expected_len, path)
+    if keep is not None:
+        # 폴백에서 행이 빠졌다. 나머지 배열도 같은 행만 남기도록 맞춘다.
+        drops["data_len_mismatch"] += int(len(chunks) - keep.sum())
+        rssi_l = [v for v, k in zip(rssi_l, keep) if k]
+        nf_l = [v for v, k in zip(nf_l, keep) if k]
+        ts_l = [v for v, k in zip(ts_l, keep) if k]
+        seq_l = [v for v, k in zip(seq_l, keep) if k]
+        cfg_l = [v for v, k in zip(cfg_l, keep) if k]
+
+    config_counter: Dict[Tuple, int] = {}
+    for key in cfg_l:
+        config_counter[key] = config_counter.get(key, 0) + 1
+
     rssi = np.asarray(rssi_l, dtype=np.int16)
     nf = np.asarray(nf_l, dtype=np.int16)
     seq = np.asarray(seq_l, dtype=np.int64)
@@ -262,9 +311,12 @@ def parse_file(
     meta: Dict[str, object] = {
         "has_header": has_header,
         "header_line_index": hdr_idx,
-        "n_lines": len(lines),
+        # split(b"\n") 은 파일이 개행으로 끝나면 빈 원소를 하나 더 만든다.
+        "n_lines": len(lines) - (1 if lines and not lines[-1].strip() else 0),
         "n_csi_lines": n_csi_lines,
         "n_valid": int(csi.shape[0]),
+        # 클래스마다 드롭률이 다르면 그 자체가 교락 요인이라 항상 같이 본다.
+        "drop_rate": (1.0 - csi.shape[0] / n_csi_lines) if n_csi_lines else float("nan"),
         "expected_len": int(expected_len),
         "macs": macs,
         "n_wrap": int(n_wrap[-1]),
@@ -277,24 +329,8 @@ def parse_file(
         top = max(config_counter.items(), key=lambda kv: kv[1])[0]
         meta["config"] = {f: v for (f, _), v in zip(cfg_idx, top)}
 
-    if use_cache:
-        try:
-            np.savez_compressed(
-                cache,
-                cache_version=np.int64(CACHE_VERSION),
-                src_mtime=np.float64(os.path.getmtime(path)),
-                src_size=np.int64(os.path.getsize(path)),
-                csi=csi, rssi=rssi, noise_floor=nf, t=t, seq=seq,
-                meta_json=np.str_(json.dumps(meta, ensure_ascii=False)),
-                drops_json=np.str_(json.dumps(drops, ensure_ascii=False)),
-                columns_json=np.str_(json.dumps(columns, ensure_ascii=False)),
-            )
-        except OSError as exc:  # 캐시 실패는 분석을 막을 이유가 아니지만 침묵하지도 않는다
-            print("[warn] 캐시 저장 실패 (%s): %s" % (cache, exc))
-
     return {"csi": csi, "rssi": rssi, "noise_floor": nf, "t": t, "seq": seq,
-            "meta": meta, "drops": drops, "columns": columns,
-            "from_cache": False}
+            "meta": meta, "drops": drops, "columns": columns}
 
 
 # ===========================================================================
@@ -329,12 +365,23 @@ class Session:
     subject: str = ""               # 피험자 식별자. 같은 사람의 세션은 완전 독립이 아니다.
     batch: str = ""                 # 수집 배치. 배치가 다르면 환경 조건이 다를 수 있다.
     segments: List[Segment] = field(default_factory=list)
-    events: List[Tuple[str, float]] = field(default_factory=list)  # (이름, 시각)
+    # 스크립트 세션의 프로토콜 구간. 타이머로 통제된 '이름 붙은 구간'이며
+    # segments(상태 라벨) 보다 잘게 쪼개져 있다. 예: turn_left 120-135s.
+    events: List[Segment] = field(default_factory=list)
+    # 자동 도출된 순간 표시 (구간 전환 시각, 지정 동작 시각). (이름, 시각)
+    markers: List[Tuple[str, float]] = field(default_factory=list)
     static_pairs: List[Tuple[str, str]] = field(default_factory=list)
 
     @property
     def n_frames(self) -> int:
         return int(self.csi.shape[0])
+
+    def event(self, name: str) -> Optional[Segment]:
+        """이름으로 프로토콜 구간을 찾는다. 없으면 None."""
+        for ev in self.events:
+            if ev.label == name:
+                return ev
+        return None
 
     @property
     def duration(self) -> float:
@@ -488,13 +535,18 @@ DOCUMENTED_BLOCKS = ("HT-LTF", "STBC-HT-LTF")
 
 
 def spec_valid_mask(n_sub: int, stbc: int = 0, bandwidth_40: bool = True,
-                    first_word_invalid: bool = True) -> np.ndarray:
+                    first_word_invalid: bool = True,
+                    block_filter: Optional[str] = None) -> np.ndarray:
     """
     규격(및 문서화되지 않은 부분은 실측)에 근거한 유효 subcarrier 마스크.
     DC / guard 의 null subcarrier 를 평균에 포함시키면 신호가 희석되므로 반드시 쓴다.
     first_word_invalid=True 이면 complex pair 0,1 (raw byte 0..3) 도 제외한다. (가정 A4)
+
+    block_filter 에 블록 이름(예: "HT-LTF")을 주면 그 블록만 True 로 남긴다.
+    이 프로젝트 데이터(n_sub=192, stbc=0)에서 block_filter="HT-LTF" 는 정확히 114개다.
     """
     mask = np.zeros(n_sub, dtype=bool)
+    found = False
     for blk in ltf_blocks(n_sub, stbc):
         if blk.name == "LLTF":
             key = ("LLTF", blk.nfft, 40 if bandwidth_40 else 20)
@@ -502,12 +554,33 @@ def spec_valid_mask(n_sub: int, stbc: int = 0, bandwidth_40: bool = True,
             key = (blk.name, blk.nfft)
         if key not in _SPEC_RANGE:
             raise CSIParseError("규격 마스크 정의가 없는 블록: %s" % (key,))
+        if block_filter is not None and blk.name != block_filter:
+            continue
+        found = True
         lo, hi = _SPEC_RANGE[key]
         sc = np.abs(fft_bin_to_subcarrier(np.arange(blk.size), blk.nfft))
         mask[blk.start:blk.stop] = (sc >= lo) & (sc <= hi)
+    if block_filter is not None and not found:
+        raise CSIParseError("block_filter=%r 에 해당하는 블록이 없다 (n_sub=%d)"
+                            % (block_filter, n_sub))
     if first_word_invalid:
+        # pair 0,1 은 LLTF 블록 안에 있으므로 HT-LTF 만 볼 때는 영향이 없다.
         mask[0:2] = False
     return mask
+
+
+def subcarrier_numbers(n_sub: int, mask: np.ndarray, stbc: int = 0) -> np.ndarray:
+    """
+    마스크가 True 인 index 의 subcarrier 번호 배열.
+
+    블록마다 FFT 크기가 다르므로(LLTF 64, HT40 의 HT-LTF 128) 번호는 반드시
+    블록별 nfft 로 환산해야 한다. 전체를 nfft=64 로 환산하면 에러 없이 조용히 틀린다.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size != n_sub:
+        raise CSIParseError("마스크 길이(%d)가 n_sub(%d)와 다르다" % (mask.size, n_sub))
+    _, scs = block_subcarriers(n_sub, stbc)
+    return scs[mask]
 
 
 def empirical_valid_mask(amp: np.ndarray, n_sub: Optional[int] = None,
@@ -785,6 +858,43 @@ def effective_rank(X: np.ndarray) -> float:
     return float(w.sum() ** 2 / (w ** 2).sum())
 
 
+def eig_spectrum(X: np.ndarray) -> np.ndarray:
+    """
+    subcarrier 상관행렬의 고유값을 내림차순으로 돌려준다. 합은 subcarrier 수와 같다.
+
+    공분산이 아니라 상관행렬을 쓰는 이유: 공분산 고유값은 진폭이 큰 subcarrier 에
+    지배당해서 '크기'를 다시 보게 된다. 여기서 보려는 것은 크기가 아니라
+    '누가 누구와 함께 움직이는가' 라는 묶임 구조다.
+    """
+    Xc = X - X.mean(axis=0, keepdims=True)
+    sd = Xc.std(axis=0, ddof=1)
+    good = sd > 0
+    if good.sum() < 2:
+        return np.array([np.nan])
+    C = np.corrcoef(Xc[:, good], rowvar=False)
+    w = np.linalg.eigvalsh(C)
+    return np.sort(w)[::-1]
+
+
+def effective_rank_entropy(eig: np.ndarray) -> float:
+    """
+    유효 랭크 = exp(고유값 분포의 섀넌 엔트로피).
+    114개 subcarrier 가 실질적으로 몇 개의 독립된 방향으로 움직이는지를 하나의 수로 잰다.
+
+      전부 제각각이면 subcarrier 수에 가깝고,
+      하나의 공통 원인으로 묶이면 값이 내려간다.
+
+    참여비(effective_rank)와는 다른 정의다. 엔트로피 쪽이 꼬리의 작은 고유값까지
+    반영하므로 '몇 개 방향' 이라는 해석에 더 맞는다. 두 정의를 섞어 쓰면 안 된다.
+    """
+    w = np.asarray(eig, dtype=np.float64)
+    w = w[np.isfinite(w) & (w > 0)]
+    if w.size == 0:
+        return float("nan")
+    p = w / w.sum()
+    return float(np.exp(-(p * np.log(p)).sum()))
+
+
 def amp_kurtosis(X: np.ndarray) -> float:
     """
     subcarrier 별 진폭 분포의 초과첨도 중앙값.
@@ -957,10 +1067,26 @@ def setup_matplotlib():
     else:
         print("[warn] 한글 폰트를 찾지 못했다. 그림의 한글이 깨질 수 있다.")
     plt.rcParams["axes.unicode_minus"] = False
+    # 주의: axes.unicode_minus=False 는 일반 눈금에만 듣는다. 로그축 지수(10^-2)는
+    # mathtext 경로라 한글 폰트에 U+2212 가 없으면 '10¤2' 로 깨진다.
+    # mathtext.fontset 을 바꿔도 해결되지 않으므로, 로그축을 쓰는 쪽에서
+    # log_tick_formatter() 로 눈금 포맷을 직접 지정해야 한다.
     plt.rcParams["figure.dpi"] = 110
     plt.rcParams["savefig.dpi"] = 150
     plt.rcParams["savefig.bbox"] = "tight"
     return plt
+
+
+def log_tick_formatter(axis) -> None:
+    """
+    로그축 눈금을 '1e-3' 형태 ASCII 로 찍는다.
+    기본 포맷터는 mathtext 로 10^-3 을 그리는데, 한글 폰트에 U+2212 가 없어
+    지수의 마이너스가 깨진 글리프로 나온다. setup_matplotlib() 만으로는 못 막는다.
+    """
+    from matplotlib.ticker import FuncFormatter
+    axis.set_major_formatter(FuncFormatter(
+        lambda v, _: "1e%d" % int(round(np.log10(v))) if v > 0 else ""))
+    axis.set_minor_formatter(FuncFormatter(lambda v, _: ""))
 
 
 # 상태별 고정 색. 모든 그림에서 같은 색을 쓴다.
