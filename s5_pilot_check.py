@@ -294,6 +294,10 @@ def main() -> int:
     print("s5_pilot_check.py — 파일럿 진단 (튜닝 없음, 조건은 s2 와 동일하게 고정)")
     print(RULE)
     sessions = S.load_all(verbose=False)
+    
+    if sessions and all(s.batch == "C" for s in sessions):
+        print("배치 C는 세션 내 empty/still 대응 설계이므로 s5 파일럿 진단을 건너뜁니다.")
+        return 0
 
     # 5분짜리 정적 세션만 (still 전용 / empty). 조건이 같아야 비교가 성립한다.
     static_rows = []

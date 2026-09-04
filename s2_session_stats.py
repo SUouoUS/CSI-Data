@@ -406,6 +406,12 @@ def main() -> int:
                     rows, "still", "empty", filt_a=all_occ)
     report_paired("비교 3) 세션 내 대조 — 정지 vs 움직임 (같은 세션, 같은 사람)",
                   rows, "motion", "still")
+    report_paired(
+        "비교 4) 세션 내 대조 — 정지 재실 vs 비재실 (같은 세션, 같은 사람)",
+        rows,
+        "still",
+        "empty",
+    )
 
     plot_windows(rows, os.path.join(S.OUT_DIR, "s2_window_boxplot.png"))
     plot_session_points(rows, os.path.join(S.OUT_DIR, "s2_session_points.png"))

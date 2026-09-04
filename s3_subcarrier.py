@@ -75,6 +75,99 @@ def per_session(profs, state, key, filt=None):
     return names, np.array([np.median(np.stack(by[n]), axis=0) for n in names])
 
 
+def paired_per_session(profs, state_a, state_b, key):
+    """같은 세션 안의 두 상태를 1:1로 맞춰 반환한다."""
+    by = {}
+
+    for p in profs:
+        if p["state"] not in (state_a, state_b):
+            continue
+
+        by.setdefault(p["session"], {}).setdefault(
+            p["state"], []
+        ).append(p[key])
+
+    names = sorted(
+        name
+        for name, states in by.items()
+        if state_a in states and state_b in states
+    )
+
+    A = np.array([
+        np.median(np.stack(by[name][state_a]), axis=0)
+        for name in names
+    ])
+
+    B = np.array([
+        np.median(np.stack(by[name][state_b]), axis=0)
+        for name in names
+    ])
+
+    return names, A, B
+
+def screen_paired(A, B, names, sc, label):
+    """같은 세션의 두 상태를 대응 비교한다."""
+    D = A - B
+    n = len(names)
+    n_valid = D.shape[1]
+
+    print()
+    print(RULE)
+    print(
+        "subcarrier 대응 스크리닝 — %s   (%d세션, 유효 %d개)"
+        % (label, n, n_valid)
+    )
+    print(RULE)
+
+    minp = core.min_two_sided_p_paired(n)
+    print("  도달 가능한 최소 양측 p = %.4f" % minp)
+
+    diff = np.median(D, axis=0)
+    ps = np.empty(n_valid)
+    same_sign = np.zeros(n_valid, dtype=bool)
+
+    for j in range(n_valid):
+        _, ps[j], _ = core.exact_perm_test_paired(D[:, j])
+        same_sign[j] = (
+            np.all(D[:, j] > 0)
+            or np.all(D[:, j] < 0)
+        )
+
+    rej, padj = core.benjamini_hochberg(ps, q=0.05)
+
+    print(
+        "  모든 세션에서 같은 방향인 subcarrier : %d / %d"
+        % (int(same_sign.sum()), n_valid)
+    )
+    print(
+        "  BH(FDR 0.05) 통과 subcarrier : %d"
+        % int(rej.sum())
+    )
+
+    order = np.argsort(-np.abs(diff))[:20]
+
+    print()
+    print("  |대응 차이 중앙값| 상위 20")
+    print(
+        "  %-5s %-8s %12s %9s %-9s"
+        % ("rank", "sc", "still-empty", "p", "부호일치")
+    )
+    print("  " + SUB)
+
+    for rank, j in enumerate(order, 1):
+        print(
+            "  %-5d %-8d %+12.4f %9.4f %-9s"
+            % (
+                rank,
+                sc[j],
+                diff[j],
+                ps[j],
+                "예" if same_sign[j] else "아니오",
+            )
+        )
+
+    return diff, ps, same_sign
+
 def screen(A, B, names_a, names_b, sc, label):
     """subcarrier 스크리닝. 효과크기 / 완전분리 / 우연 기대치."""
     na, nb = A.shape[0], B.shape[0]
@@ -216,17 +309,72 @@ def main() -> int:
     print("유효 subcarrier %d개 (%s), 프로파일 %d개"
           % (mask.sum(), S.ANALYSIS_BLOCK, len(profs)))
 
-    still_only = {s.name for s in sessions
-                  if [sg.label for sg in s.segments] == ["still"]}
+        # Batch C는 같은 세션 안에 still/empty가 모두 있으므로 대응 비교한다.
+    is_batch_c = any(s.batch == "C" for s in sessions)
 
-    na, A = per_session(profs, "still", "mean", filt=still_only)
-    nb, B = per_session(profs, "empty", "mean")
-    print("\n[비교 1] 정지 전용 세션 %s  vs  비재실 %s" % (na, nb))
-    d1, p1, f1 = screen(A, B, na, nb, sc, "재실(정지) vs 비재실 — 평균진폭")
+    if is_batch_c:
+        pair_names, A2, B = paired_per_session(
+            profs,
+            "still",
+            "empty",
+            "mean",
+        )
 
-    na2, A2 = per_session(profs, "still", "mean")
-    print("\n[비교 2] 재실 전체 %s  vs  비재실 %s" % (na2, nb))
-    d2, p2, f2 = screen(A2, B, na2, nb, sc, "재실 전체 vs 비재실 — 평균진폭")
+        print(
+            "\n[비교] 세션 내 재실(still) vs 비재실(empty) %s"
+            % pair_names
+        )
+
+        d2, p2, f2 = screen_paired(
+            A2,
+            B,
+            pair_names,
+            sc,
+            "재실(still) vs 비재실(empty) — 평균진폭",
+        )
+
+    else:
+        still_only = {
+            s.name
+            for s in sessions
+            if [sg.label for sg in s.segments] == ["still"]
+        }
+
+        na, A = per_session(
+            profs,
+            "still",
+            "mean",
+            filt=still_only,
+        )
+        nb, B = per_session(profs, "empty", "mean")
+
+        print(
+            "\n[비교 1] 정지 전용 세션 %s  vs  비재실 %s"
+            % (na, nb)
+        )
+        d1, p1, f1 = screen(
+            A,
+            B,
+            na,
+            nb,
+            sc,
+            "재실(정지) vs 비재실 — 평균진폭",
+        )
+
+        na2, A2 = per_session(profs, "still", "mean")
+
+        print(
+            "\n[비교 2] 재실 전체 %s  vs  비재실 %s"
+            % (na2, nb)
+        )
+        d2, p2, f2 = screen(
+            A2,
+            B,
+            na2,
+            nb,
+            sc,
+            "재실 전체 vs 비재실 — 평균진폭",
+        )
 
     # 세션 내 대조: 움직임 vs 정지 (같은 세션)
     print()
