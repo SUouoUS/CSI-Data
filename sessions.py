@@ -294,7 +294,25 @@ SESSIONS: List[Dict[str, object]] = [
     #    "subject": "-", "batch": "A", "t_offset": 0.0,
     #    "segments": [("empty", 0.0, 299.0)]},
     # =======================================================================
+    {"name": "C_P01", "scenario": "S-8", "file": "P01_0902_run1.txt",
+     "subject": "P01", "batch": "C", "t_offset": 0.0,
+     "segments": P14_SEGMENTS,
+     "static_pairs": [("empty@0", "empty@1")]},
 
+    {"name": "C_P02", "scenario": "S-8", "file": "P02_0902.txt",
+     "subject": "P02", "batch": "C", "t_offset": 0.0,
+     "segments": P14_SEGMENTS,
+     "static_pairs": [("empty@0", "empty@1")]},
+
+    {"name": "C_P03", "scenario": "S-8", "file": "P03_0902.txt",
+     "subject": "P03", "batch": "C", "t_offset": 0.0,
+     "segments": P14_SEGMENTS,
+     "static_pairs": [("empty@0", "empty@1")]},
+
+    {"name": "C_P04", "scenario": "S-8", "file": "P04_0902.txt",
+     "subject": "P04", "batch": "C", "t_offset": 0.0,
+     "segments": P14_SEGMENTS,
+     "static_pairs": [("empty@0", "empty@1")]},
     # =======================================================================
     # 배치 C : 14분 프로토콜(S-8), 피험자 4명. 2026-09-02 수집.
     #
