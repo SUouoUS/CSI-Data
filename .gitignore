@@ -9,3 +9,6 @@ data/*.cache.npz
 # OS
 Thumbs.db
 .DS_Store
+data/
+incoming_batch_c/
+archive/
